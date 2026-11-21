@@ -1,0 +1,34 @@
+# secrets
+.env
+.env.local
+credentials.json
+client_secret*.json
+
+# generated output
+output/
+tests/_tmp/
+*.backup-*.xlsx
+*.eml
+src_test.json
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+site/
+dist/
+.venv/
+venv/
+
+# tooling / debug artefacts
+*.tgz
+copilot-debug-logs-*
+~/
+.vscode/
+.idea/
+.DS_Store
+
+# per-run reports with third-party contact data
+FAILURES.json
+diag_tmp_*.txt

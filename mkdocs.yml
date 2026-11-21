@@ -1,0 +1,54 @@
+site_name: Agnostos
+site_description: "Agnostos: research internship outreach tool that finds matching professors and writes honest, personalised cold emails."
+site_url: https://amandacode4.github.io/agnostos-aman/
+site_author: Amandacode4
+copyright: "&copy; 2026 Amandacode4"
+repo_url: https://github.com/Amandacode4/agnostos-aman
+repo_name: Amandacode4/agnostos-aman
+edit_uri: edit/main/docs/
+docs_dir: docs
+strict: true
+exclude_docs: |
+  *.tex
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: green
+      accent: green
+      toggle: {icon: material/brightness-4, name: Light mode}
+    - scheme: default
+      primary: green
+      accent: green
+      toggle: {icon: material/brightness-7, name: Dark mode}
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+
+nav:
+  - Home: index.md
+  - Setup:
+      - Windows: install-windows.md
+      - macOS: install-macos.md
+      - Linux: install-linux.md
+  - FAQ: faq.md
+  - Diagnostics: diagnostics.md
+  - Google Calendar: calendar.md
+  - Technical report (PDF): Agnostos_Technical_Report.pdf
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc: {permalink: true}
+  - pymdownx.superfences
+  - pymdownx.highlight
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Amandacode4
+      name: Amandacode4 on GitHub

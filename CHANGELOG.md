@@ -1,0 +1,123 @@
+# Changelog
+
+All notable changes to Agnostos are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
+[Semantic Versioning](https://semver.org/): MAJOR for breaking CLI/workbook
+changes, MINOR for new commands or options, PATCH for fixes.
+
+## [Unreleased]
+
+## [2.3.0] - 2026-11-19
+
+### Added
+- **Funding factor** (`outreach/funding.py`) scores each host 0-1 for how likely it is to fund a visiting student. Inputs are known paid schemes (company research labs and funded facilities and programmes such as CERN, DESY, PSI, Max Planck, EPFL, ETH, OIST and KAUST), country routes (Charpak, DAAD, TEEP and others), and "no funding" replies, which set the score to 0. `FUNDING_WEIGHT` blends the score into `run`, `discover`, `legacy --find` and `send --top` ordering. The relevance floor still applies to topic fit only. Workbooks gain **Funding Score** and **Funding Route** columns. Drafts may name the programme but never mention money.
+- Company and individual-lab search: `discover --include-companies` (`DISCOVER_INCLUDE_COMPANIES`) and `legacy --companies`.
+- The desktop app exposes the funding weight, company search, and the legacy `--any-field` and `--match` options.
+- macOS build: `build-mac.sh` produces a `.app` and `.dmg` (`tauri.macos.conf.json`). The engine stores sign-in tokens in the macOS Keychain and data in `~/Library/Application Support/Agnostos`.
+- `COLD_DAILY_HARD_CAP` is configurable (1-90); `MAX_PER_DOMAIN_WEEK` is documented for large institutions.
+- Deferred verification queue: unverified recipients are skipped at send time and checked later with `verify --deferred`.
+
+### Changed
+- Windows installer and ZIP are now version 2.3.0. The README has a Download section that links to the latest release.
+
+### Removed
+- Personal files `output/no_cold_email.json` and `output/confirmed_facts.md` are no longer tracked. Tests that need them skip when the files are absent.
+
+### Added (desktop and privacy)
+- Native PySide6 Windows application with guided controls for all v2 CLI
+  commands, local settings, first-email and reply-draft review, job logs and
+  progress. The existing CLI remains the internal engine and can still run
+  scheduled automation.
+- Offline Windows ZIP build with packaged CLI, Qt widgets and discovery
+  resources; it does not contain user credentials, workbooks or mail.
+
+### Fixed
+- Legacy live sends now require verified, in-focus recipients and respect
+  weekday/local windows, funding rules, a shared daily cap and per-run address
+  deduplication. The desktop additionally rejects zero live-send limits and
+  refuses raw safety-bypass flags in its packaged worker.
+- The desktop apps now expose `program-reminders` and `coordinators`
+  (coordinator live sends need typed `SEND COORDINATORS` confirmation).
+- Docker build context no longer includes local `build/`, `dist/`, `app/`,
+  egg-info or diagnostic files; `build-engine.ps1` falls back to the `python`
+  on PATH when the default interpreter path does not exist.
+- Privacy: personal addresses, phone number, CV folder, CV link and the
+  owner's self-introduction are no longer hard-coded; they come from
+  `REMINDER_RECIPIENTS`, `REMINDER_SMS_TO`, `REMINDER_TZ`, `PROGRAM_CV_DIR`,
+  `CV_URL`, `STUDENT_INTRO` and `SUBJECT_TAG` in `.env` (unset = feature
+  disabled with a message). `build-app.ps1` remaps build-machine paths so the
+  shipped `agnostos.exe` does not contain them.
+
+## [2.2.0] - 2026-11-04
+
+### Added
+- Windows Python 3.15 support for the CLI without C++ Build Tools, with a
+  wheel-only Windows CI job and Python 3.15 tests.
+- A standalone Windows desktop reviewer for existing v2 workbooks,
+  conversations and selectively approved reply drafts. Sending remains in
+  the CLI; the packaged application contains no credentials or user data.
+
+### Fixed
+- Replace required PyYAML (no Windows 3.15 wheel) with a pure-Python YAML
+  reader for scraping sources and include `tzdata` so recipient-local
+  sending windows work in a fresh Windows virtual environment.
+- IMAP reply scans reconnect after transient session loss; the first-email
+  cap survives sender restarts; wrongly named reply greetings are blocked.
+- Resume configuration errors identify a missing/placeholder path, directory,
+  unsupported extension or missing `.env` dependency rather than failing
+  later with misleading errors.
+
+## [2.1.0] - 2026-11-01
+
+### Added
+- `agnostos --version`. The version is defined once in `outreach/__init__.py`.
+- Docker image (`Dockerfile`, `compose.yaml`) and a release workflow that
+  publishes a wheel, an sdist, a GitHub Release and `ghcr.io/amandacode4/agnostos`
+  for every `v*` tag.
+- Single-instance lock for live `send`, `resend` and `replies --send`. A
+  scheduled task and a manual run can no longer mail the same people twice.
+- `ddgs` (email lookup) is now a declared dependency, plus a `calendar` extra
+  for the Google Calendar integration.
+
+### Fixed
+- `send` crashed with `BadZipFile` when another process was saving
+  `professors.xlsx` at the same moment. Reads now retry, and saves are atomic
+  (written to a temp file, then swapped in).
+- `verify --repair` could hang forever on a stuck web search. Each search now
+  has a hard deadline, and a working `yahoo` backend was added.
+- Countdown timers wrote a line every second into piped logs (40 MB+). When
+  output is not a terminal, they now update once a minute.
+- `.env` is also read from the working directory, so pip and Docker installs
+  pick it up.
+
+## [2.0.0] - 2026-10-30
+
+### Added
+- `discover`: `--top-universities`, `--also-universities`, `--list-universities`.
+- `verify`: `--only-missing`, arXiv/PDF address extraction, cross-site confirmation.
+- `resend`: re-deliver the original email from a second account (`--prioritize-top`).
+- `replies`: funding follow-ups, meeting requests with Google Calendar holds,
+  thread-aware follow-ups, `--approve-all`, recipient-local send windows, and
+  automatic CV attachment.
+- `conversations` (HTML view of every thread) and `archive-sent` (IMAP Sent copies).
+- `legacy`: letters to leading researchers in your field.
+- `replace-failed`: swaps a bounced professor for a same-institution colleague.
+- `FOCUS` / `FOCUS_KEYWORDS` filter, `CAN_SELF_FUND` guard, a live dashboard,
+  and resend/reply counts in `stats`.
+- Technical report, MkDocs site and citation metadata.
+
+### Fixed
+- Mass "invalid" results on Windows during `verify`.
+- `run` never redrafts rows that were already sent.
+- Wrong-person matches (given-name and country conflicts).
+
+## [1.0.0] - 2026-10-13
+
+- First public release: resume parsing, local matcher, OpenAlex enrichment,
+  LLM drafting with de-slop pass, throttled SMTP sending, Excel round-trip.
+
+[Unreleased]: https://github.com/Amandacode4/agnostos-aman/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/Amandacode4/agnostos-aman/compare/v2.2.0...v2.3.0
+[2.2.0]: https://github.com/Amandacode4/agnostos-aman/compare/v2.1.0...v2.2.0
+[2.1.0]: https://github.com/Amandacode4/agnostos-aman/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/Amandacode4/agnostos-aman/releases/tag/v2.0.0

@@ -1,0 +1,480 @@
+"""Email dispatch: SMTP with attachments, throttling, dry-run, and resume safety."""
+from __future__ import annotations
+
+import mimetypes
+from difflib import SequenceMatcher
+import random
+import re
+import smtplib
+import ssl
+import sys
+import time
+import unicodedata
+from datetime import datetime
+from email.message import EmailMessage
+from email.utils import formataddr, formatdate, make_msgid
+from pathlib import Path
+
+from .config import COLD_DAILY_HARD_CAP, Settings
+from .google_oauth import load_token_file, smtp_authenticate, uses_xoauth2
+from .resume_parser import ResumeProfile
+from .schedule import fmt_duration as _fmt
+from .tls import context as tls_context
+
+SIGNATURE = """
+--
+{name}
+{degree}
+{institution}
+{email}{phone}"""
+
+# Mail servers that reject or drop this many messages in a row are throttling
+# or refusing the account; continuing just marks every remaining row failed.
+MAX_CONSECUTIVE_FAILURES = 3
+CONNECT_ATTEMPTS = 3
+
+_ATTACH_RE = re.compile(r"\battach(?:ed|ing|ment|ments)?\b|\benclos(?:ed|ing)\b|"
+                        r"\bplease find my (?:cv|resume|transcript)", re.I)
+
+
+def mentions_attachment(body: str) -> bool:
+    return bool(_ATTACH_RE.search(body or ""))
+
+
+def build_signature(profile: ResumeProfile) -> str:
+    return SIGNATURE.format(
+        name=profile.name,
+        degree=profile.degree + (f" (expected {profile.graduation_year})" if profile.graduation_year else ""),
+        institution=profile.institution,
+        email=profile.email,
+        phone=f"\n{profile.phone}" if profile.phone else "",
+    )
+
+
+class Mailer:
+    def __init__(self, settings: Settings, profile: ResumeProfile | None = None,
+                 dry_run: bool = True, redirect_to: str = ""):
+        self.s = settings
+        self.profile = profile
+        self.dry_run = dry_run
+        # When set, every message is delivered here instead of the professor.
+        self.redirect_to = redirect_to
+        self.signature = build_signature(profile) if profile else ""
+        self._server: smtplib.SMTP | None = None
+        self.sent_count = 0
+
+    # ---------- connection ----------
+    def connect(self):
+        if self.dry_run:
+            return
+        required = {
+            "SMTP_HOST": self.s.smtp_host,
+            "SMTP_USER": self.s.smtp_user,
+            "SMTP_FROM": self.s.smtp_from,
+        }
+        if uses_xoauth2(self.s):
+            # Fail fast with a clear message rather than retrying a config error.
+            load_token_file(getattr(self.s, "google_oauth_token_file", ""))
+        else:
+            required["SMTP_PASSWORD"] = self.s.smtp_password
+        missing = [k for k, v in required.items()
+                   if not v or "your_" in str(v) or "your-university" in str(v)]
+        if missing:
+            raise RuntimeError(
+                f"SMTP settings still at placeholder values in .env: {', '.join(missing)}")
+        # A busy relay sometimes stalls the greeting/login; that is transient,
+        # so retry with backoff instead of aborting the whole run.
+        for attempt in range(1, CONNECT_ATTEMPTS + 1):
+            try:
+                self._open()
+                return
+            except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError,
+                    TimeoutError, OSError):
+                self.close()
+                if attempt == CONNECT_ATTEMPTS:
+                    raise
+                time.sleep(15 * attempt)
+
+    def _open(self):
+        context = tls_context()
+        timeout = self.s.smtp_timeout
+        if self.s.smtp_security.lower() == "ssl":
+            self._server = smtplib.SMTP_SSL(self.s.smtp_host, self.s.smtp_port,
+                                            context=context, timeout=timeout)
+        else:
+            self._server = smtplib.SMTP(self.s.smtp_host, self.s.smtp_port, timeout=timeout)
+            self._server.ehlo()
+            if self.s.smtp_security.lower() == "starttls":
+                self._server.starttls(context=context)
+                self._server.ehlo()
+        if uses_xoauth2(self.s):
+            smtp_authenticate(self._server, self.s.smtp_user, self.s.google_oauth_token_file,
+                              timeout=timeout)
+        else:
+            self._server.login(self.s.smtp_user, self.s.smtp_password)
+
+    def close(self):
+        if self._server:
+            try:
+                self._server.quit()
+            except Exception:
+                pass
+            self._server = None
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+    def build_reply(self, to_email: str, to_name: str, subject: str, body: str,
+                    in_reply_to: str = "", references: str = "",
+                    attachments: list[str] | None = None) -> EmailMessage:
+        """A threaded follow-up: Re: subject, In-Reply-To/References. ATTACHMENTS
+        (your CV) are added only when the body says something is attached.
+        `attachments` (a queue item's own list) replaces ATTACHMENTS and is always
+        attached; an empty list means the reply must not promise an attachment."""
+        if isinstance(attachments, str):
+            attachments = [attachments]
+        # IMAP headers may arrive folded across lines; header values can't contain CR/LF.
+        subject, in_reply_to, references, to_name = (
+            " ".join(str(v or "").split()) for v in (subject, in_reply_to, references, to_name))
+        salutation = re.match(r"^\s*Dear\s+(?:Professor|Prof\.?|Dr\.?)\s+([^,:\n]+)",
+                              body, re.I)
+        if salutation and to_name:
+            surname = to_name.split()[-1].strip(".,")
+            def fold(value):
+                return "".join(ch for ch in unicodedata.normalize("NFKD", value.casefold())
+                               if not unicodedata.combining(ch))
+            names = re.findall(r"[^\W\d_]+(?:[-'][^\W\d_]+)*", salutation.group(1))
+            if names and not any(SequenceMatcher(None, fold(surname), fold(n)).ratio() >= 0.8
+                                 for n in names):
+                raise ValueError(f"reply salutation names someone else: {salutation.group(0).strip()!r} "
+                                 f"for {to_name!r}; correct the draft before sending")
+        msg = EmailMessage()
+        from_name = self.s.smtp_from_name or (self.profile.name if self.profile else "")
+        msg["From"] = formataddr((from_name, self.s.smtp_from)) if from_name else self.s.smtp_from
+        msg["To"] = formataddr((to_name, to_email)) if to_name else to_email
+        msg["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+        msg["Date"] = formatdate(localtime=True)
+        msg["Message-ID"] = make_msgid(domain=self.s.smtp_from.rpartition("@")[2] or None)
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+            msg["References"] = " ".join(x for x in (references, in_reply_to) if x).strip()
+        if self.s.reply_to:
+            msg["Reply-To"] = self.s.reply_to
+        msg.set_content(body.rstrip() + "\n" + self.signature)
+        if attachments:
+            self._attach_files(msg, list(attachments))
+        elif mentions_attachment(body):
+            # The draft promises an attachment, so it must actually be there.
+            if attachments is not None or not self._attach_files(msg):
+                raise ValueError("reply says something is attached but no ATTACHMENTS "
+                                 "file exists; fix ATTACHMENTS in .env or edit the body")
+        return msg
+
+    def _attach_files(self, msg: EmailMessage, paths: list[str] | None = None) -> int:
+        """Attach `paths` (a per-message list) or, when None, the global ATTACHMENTS.
+        Missing global files are skipped; a missing per-message file is an error,
+        since that row explicitly promised it."""
+        explicit = paths is not None
+        n = 0
+        for raw_path in (paths if explicit else self.s.attachments):
+            path = Path(raw_path)
+            if not path.is_file():
+                if explicit:
+                    raise FileNotFoundError(f"attachment not found: {raw_path}")
+                continue
+            ctype, _ = mimetypes.guess_type(str(path))
+            maintype, _, subtype = (ctype or "application/octet-stream").partition("/")
+            msg.add_attachment(path.read_bytes(), maintype=maintype,
+                               subtype=subtype, filename=path.name)
+            n += 1
+        return n
+
+    def _guard(self, msg: EmailMessage) -> None:
+        """Last line of defence: never send an offer to pay one's own way."""
+        if self.s.can_self_fund in {"1", "true", "yes", "y", "on"}:
+            return
+        from .humanize import offers_self_funding
+        body = msg.get_body(("plain",))
+        hits = offers_self_funding(body.get_content() if body else "")
+        if hits:
+            raise ValueError(f"blocked: email offers self-funding (CAN_SELF_FUND=no): {hits[0][:90]}")
+
+    def deliver(self, msg: EmailMessage) -> None:
+        self._guard(msg)
+        if self.dry_run:
+            return
+        self._deliver(msg)
+        self.sent_count += 1
+        self._archive(msg)
+
+    def _archive(self, msg: EmailMessage) -> None:
+        """Copy to the IMAP Sent folder so the thread is complete in mail apps."""
+        try:
+            from .mailbox import save_copy
+            save_copy(self.s, msg)
+        except Exception as exc:
+            print(f"    (could not copy to Sent folder: {type(exc).__name__}: {exc})"[:160])
+
+    # ---------- message ----------
+    def build_message(self, to_email: str, to_name: str, subject: str,
+                      body: str, attachments: list[str] | None = None,
+                      cv_link: bool = True) -> EmailMessage:
+        """A cold first email. `attachments` (e.g. a legacy row's "Attachment"
+        cell) is attached as given. Without it, ATTACHMENTS (the CV) is attached
+        only when COLD_ATTACH_CV=true; otherwise the CV is linked via CV_URL
+        in the signature (unless the body already links it, or cv_link=False)."""
+        msg = EmailMessage()
+        from_name = self.s.smtp_from_name or (self.profile.name if self.profile else "")
+        msg["From"] = formataddr((from_name, self.s.smtp_from)) if from_name else self.s.smtp_from
+        msg["To"] = formataddr((to_name, to_email)) if to_name else to_email
+        msg["Subject"] = subject
+        msg["Date"] = formatdate(localtime=True)
+        msg["Message-ID"] = make_msgid(
+            domain=self.s.smtp_from.rpartition("@")[2] or None)
+        if self.s.reply_to:
+            msg["Reply-To"] = self.s.reply_to
+        attach_global = attachments is None and getattr(self.s, "cold_attach_cv", False)
+        signature = self.signature
+        cv_url = str(getattr(self.s, "cv_url", "") or "").strip()
+        if cv_link and cv_url and not attachments and not attach_global and self.signature:
+            bare = re.sub(r"^https?://", "", cv_url).rstrip("/").lower()
+            if bare not in body.lower():
+                signature = signature.rstrip() + f"\nCV: {cv_url}"
+        full_body = body.rstrip() + "\n" + signature
+        msg.set_content(full_body)
+        if attachments is not None:
+            self._attach_files(msg, attachments)
+        elif attach_global:
+            self._attach_files(msg)
+        return msg
+
+    # ---------- sending ----------
+    def _deliver(self, msg: EmailMessage) -> None:
+        """Send one message, reconnecting once if the server dropped us.
+
+        University relays routinely close the socket after a few messages or
+        an idle gap. A dropped connection is transient, so rebuild it and try
+        again rather than failing every remaining row against a dead socket.
+        """
+        try:
+            if self._server is None:
+                self.connect()
+            self._server.send_message(msg)
+            return
+        except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, OSError):
+            self.close()
+            self.connect()
+            self._server.send_message(msg)
+
+    def send_one(self, row: dict) -> dict:
+        subject = row.get("subject") or "Summer research internship enquiry"
+        to_email = row["email"]
+        to_name = row.get("name", "")
+        if self.redirect_to:
+            # Review mode: deliver to yourself, but keep the real target visible.
+            subject = f"[DRAFT -> {to_email}] {subject}"
+            to_email, to_name = self.redirect_to, ""
+        msg = self.build_message(to_email, to_name, subject, row["body"])
+        try:
+            self._guard(msg)
+        except ValueError as exc:
+            return {"status": "skipped: self-funding offer", "detail": str(exc), "message": msg}
+        if self.dry_run:
+            return {"status": "dry-run", "detail": "not sent", "message": msg}
+        try:
+            self._deliver(msg)
+            self.sent_count += 1
+            if not self.redirect_to:
+                self._archive(msg)
+            status = "review-sent" if self.redirect_to else "sent"
+            return {"status": status, "detail": "", "message": msg}
+        except Exception as exc:
+            return {"status": f"failed: {type(exc).__name__}", "detail": str(exc)[:200],
+                    "message": msg}
+
+    def save_eml(self, row: dict, directory: Path) -> Path:
+        """Write a draft as a .eml file that any mail client can open."""
+        directory.mkdir(parents=True, exist_ok=True)
+        msg = self.build_message(row["email"], row.get("name", ""),
+                                 row.get("subject") or "Summer research internship enquiry",
+                                 row["body"])
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", row.get("name") or row["email"]).strip("_")[:50]
+        path = directory / f"{row.get('probability', 0):03d}_{slug}.eml"
+        path.write_bytes(msg.as_bytes())
+        return path
+
+    def send_batch(self, rows: list[dict], progress=None,
+                   resend: bool = False, top: int | None = None,
+                   allow_unverified: bool = False, window=None,
+                   wait_for_window: bool = False, on_update=None,
+                   initial_sent_by_date: dict[str, int] | None = None,
+                   guard=None) -> list[dict]:
+        """Send pending rows. With `window` (a schedule.SendWindow), a row only
+        goes out inside the recipient's local hours; rows outside it are left
+        untouched, or waited for when `wait_for_window` is set. With `guard`
+        (a send_guard.ColdGuard), blocked recipients are skipped with a reason
+        and the per-domain weekly cap is enforced. These are cold first emails,
+        so the daily cap is clamped at COLD_DAILY_HARD_CAP whatever .env says."""
+        updates = []
+        daily_cap = min(self.s.daily_send_cap, COLD_DAILY_HARD_CAP)
+        # A dry run must never block a later real send, and neither may a
+        # review copy sent to yourself: only real deliveries count when live.
+        done = {"sent", "review-sent"} if self.redirect_to else {"sent"}
+        pending = [
+            r for r in rows
+            if (resend or r.get("send_status", "").lower() not in done)
+            and r.get("probability", 0) >= self.s.send_min_probability
+        ]
+        if guard is not None:
+            kept = []
+            for r in pending:
+                why = guard.permanent_reason(r, allow_unverified=allow_unverified)
+                if not why:
+                    kept.append(r)
+                    continue
+                skip = {"sheet": r["sheet"], "row": r["row"], "status": why,
+                        "detail": "", "sent_at": ""}
+                updates.append(skip)
+                if progress:
+                    progress(0, 0, r, {"status": why, "detail": "", "message": None})
+            pending = kept
+        if top:
+            # Mail the N strongest matches, not the first N in sheet order.
+            # Funding likelihood (0..1) adds up to FUNDING_WEIGHT * 20 points.
+            fw = getattr(self.s, "funding_weight", 0.0) or 0.0
+            pending = sorted(pending, key=lambda r: -(r.get("probability", 0)
+                                                      + fw * 20.0 * r.get("funding", 0.0)))[:top]
+        total = len(pending)
+        queue = list(enumerate(pending, 1))
+        consecutive_failures = 0
+
+        def cap_reached() -> bool:
+            if self.dry_run:
+                return False
+            if initial_sent_by_date is None:
+                return self.sent_count >= daily_cap
+            today = datetime.now().strftime("%Y-%m-%d")
+            sent_now = sum(1 for u in updates if u["status"] == "sent"
+                           and u.get("sent_at", "").startswith(today))
+            return initial_sent_by_date.get(today, 0) + sent_now >= daily_cap
+
+        while queue:
+            if cap_reached():
+                # Leave the rest untouched for the next run instead of waiting
+                # out their local windows just to mark them skipped.
+                break
+            if window is not None:
+                pick = next((k for k, (_, r) in enumerate(queue) if window.ready(r)), None)
+                if pick is None:
+                    waits = [window.seconds_until(r) for _, r in queue]
+                    if wait_for_window and not self.dry_run:
+                        self.close()
+                        self._countdown(min(waits), label="next local send window opens")
+                        continue
+                    for (i, row), w in zip(queue, waits):
+                        if progress:
+                            progress(i, total, row, {
+                                "status": "held",
+                                "detail": f"outside local window, opens in {_fmt(w)}",
+                                "message": None})
+                    break
+                i, row = queue.pop(pick)
+            else:
+                i, row = queue.pop(0)
+            if cap_reached():
+                updates.append({**row, "status": "skipped: daily cap reached"})
+                continue
+            if row.get("email_status") == "invalid" and not allow_unverified:
+                # `verify` proved this address is undeliverable; sending anyway
+                # only generates bounces and hurts the sending domain.
+                result = {"status": "skipped: invalid address",
+                          "detail": "run `verify --repair`, or pass --allow-unverified",
+                          "message": None}
+                updates.append({"sheet": row["sheet"], "row": row["row"],
+                                "status": result["status"],
+                                "detail": result["detail"], "sent_at": ""})
+                if progress:
+                    progress(i, total, row, result)
+                continue
+            why = guard.domain_reason(row) if guard is not None else ""
+            if why:
+                updates.append({"sheet": row["sheet"], "row": row["row"], "status": why,
+                                "detail": "", "sent_at": ""})
+                if progress:
+                    progress(i, total, row, {"status": why, "detail": "", "message": None})
+                continue
+            result = self.send_one(row)
+            if guard is not None and result["status"] in {"sent", "dry-run"}:
+                guard.record(row)
+            update = {
+                "sheet": row["sheet"], "row": row["row"],
+                "status": result["status"],
+                "detail": result.get("detail", ""),
+                "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if result["status"] in {"sent", "review-sent", "dry-run"} else "",
+            }
+            if result["status"] == "sent" and result.get("message") is not None:
+                update["message_id"] = result["message"]["Message-ID"]
+            updates.append(update)
+            if on_update:
+                on_update(update)
+            if progress:
+                progress(i, total, row, result)
+
+            if result["status"].startswith("failed"):
+                # A mail server that rejects or drops several in a row is
+                # throttling or refusing the account. Hammering it burns the
+                # sender reputation and marks every remaining row failed.
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    if progress:
+                        progress(i, total, row, {
+                            "status": "aborted",
+                            "detail": f"{consecutive_failures} consecutive SMTP failures; "
+                                      "stopping so the rest stay sendable",
+                            "message": None,
+                        })
+                    break
+                if self.s.send_delay_max:
+                    time.sleep(min(30.0, 5.0 * consecutive_failures))
+                continue
+
+            consecutive_failures = 0
+            if queue and result["status"] in {"sent", "review-sent"}:
+                delay = random.uniform(self.s.send_delay_min, self.s.send_delay_max)
+                if delay > 30 and not self.dry_run:
+                    # The relay drops idle sessions within minutes; reconnect
+                    # fresh for the next message rather than reuse a dead socket.
+                    self.close()
+                self._countdown(delay)
+        return updates
+
+    @staticmethod
+    def _countdown(delay: float, label: str = "next email") -> None:
+        """Sleep for `delay` seconds while showing a live timer on the console.
+
+        Uses the wall clock, not time.monotonic(): on macOS (and some Windows
+        builds) the monotonic clock pauses while the laptop sleeps, so a lid
+        close would silently stretch every wait by the time spent asleep.
+        """
+        start = time.time()
+        deadline = start + delay
+        total = _fmt(delay)
+        # Piped to a log (Tee-Object, >>), a once-a-second timer bloats the
+        # file by megabytes per wait; there, update once a minute instead.
+        tick = 1.0 if sys.stdout.isatty() else 60.0
+        while True:
+            now = time.time()
+            elapsed, left = now - start, deadline - now
+            if left <= 0:
+                break
+            sys.stdout.write(f"\r    waiting {_fmt(elapsed)} / {total} "
+                             f"({label} in {_fmt(left + 0.999)})  ")
+            sys.stdout.flush()
+            time.sleep(min(tick, left))
+        sys.stdout.write(f"\r    waited {total} ({label}){' ' * 40}\n")
+        sys.stdout.flush()
